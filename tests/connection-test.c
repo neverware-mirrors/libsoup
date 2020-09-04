@@ -752,16 +752,6 @@ do_non_idempotent_connection_test (void)
 #define HTTPS_SERVER "https://127.0.0.1:47525"
 #define HTTP_PROXY   "http://127.0.0.1:47526"
 
-static SoupConnectionState state_transitions[] = {
-	/* NEW -> */        SOUP_CONNECTION_CONNECTING,
-	/* CONNECTING -> */ SOUP_CONNECTION_IN_USE,
-	/* IDLE -> */       SOUP_CONNECTION_DISCONNECTED,
-	/* IN_USE -> */     SOUP_CONNECTION_IDLE,
-
-	/* REMOTE_DISCONNECTED */ -1,
-	/* DISCONNECTED */        -1,
-};
-
 static const char *state_names[] = {
 	"NEW", "CONNECTING", "IDLE", "IN_USE",
 	"REMOTE_DISCONNECTED", "DISCONNECTED"
@@ -777,9 +767,34 @@ connection_state_changed (GObject *object, GParamSpec *param,
 	g_object_get (object, "state", &new_state, NULL);
 	debug_printf (2, "      %s -> %s\n",
 		      state_names[*state], state_names[new_state]);
-	soup_test_assert (state_transitions[*state] == new_state,
-			  "Unexpected transition: %s -> %s\n",
-			  state_names[*state], state_names[new_state]);
+	switch (*state) {
+	case SOUP_CONNECTION_NEW:
+		soup_test_assert (new_state == SOUP_CONNECTION_CONNECTING,
+				  "Unexpected transition: %s -> %s\n",
+				  state_names[*state], state_names[new_state]);
+		break;
+	case SOUP_CONNECTION_CONNECTING:
+		soup_test_assert (new_state == SOUP_CONNECTION_IN_USE || new_state == SOUP_CONNECTION_DISCONNECTED,
+				  "Unexpected transition: %s -> %s\n",
+				  state_names[*state], state_names[new_state]);
+		break;
+	case SOUP_CONNECTION_IDLE:
+		soup_test_assert (new_state == SOUP_CONNECTION_IN_USE || new_state == SOUP_CONNECTION_DISCONNECTED,
+				  "Unexpected transition: %s -> %s\n",
+				  state_names[*state], state_names[new_state]);
+		break;
+	case SOUP_CONNECTION_IN_USE:
+		soup_test_assert (new_state == SOUP_CONNECTION_IDLE,
+				  "Unexpected transition: %s -> %s\n",
+				  state_names[*state], state_names[new_state]);
+		break;
+	case SOUP_CONNECTION_REMOTE_DISCONNECTED:
+	case SOUP_CONNECTION_DISCONNECTED:
+		soup_test_assert (FALSE,
+				  "Unexpected transition: %s -> %s\n",
+				  state_names[*state], state_names[new_state]);
+		break;
+	}
 	*state = new_state;
 }
 
@@ -1187,6 +1202,318 @@ do_connection_connect_test (void)
         soup_test_session_abort_unref (session);
 }
 
+typedef struct {
+        GMainLoop *loop;
+        GError *error;
+        const char *events;
+        SoupConnectionState state;
+        GObject *conn;
+        gboolean quit_on_preconnect;
+} PreconnectTestData;
+
+static void
+preconnection_created (SoupSession        *session,
+                       GObject            *conn,
+                       PreconnectTestData *data)
+{
+        g_object_get (conn, "state", &data->state, NULL);
+        g_assert_cmpint (data->state, ==, SOUP_CONNECTION_NEW);
+
+        g_assert_null (data->conn);
+        data->conn = g_object_ref (conn);
+
+        g_signal_connect (conn, "notify::state",
+                          G_CALLBACK (connection_state_changed),
+                          &data->state);
+}
+
+static void
+preconnect_progress (SoupSession        *session,
+                     GSocketClientEvent  event,
+                     GIOStream          *connection,
+                     PreconnectTestData *data)
+{
+        soup_test_assert (*data->events == event_abbrevs[event],
+                          "Unexpected event: %s (expected %s)",
+                          event_names[event],
+                          event_name_from_abbrev (*data->events));
+        data->events = data->events + 1;
+}
+
+static void
+preconnect_finished (SoupSession        *session,
+                     GAsyncResult       *result,
+                     PreconnectTestData *data)
+{
+        soup_session_preconnect_finish (session, result, &data->error);
+        if (data->quit_on_preconnect)
+                g_main_loop_quit (data->loop);
+}
+
+static void
+do_idle_connection_preconnect_test (SoupURI *uri, SoupURI *proxy_uri, const char *events)
+{
+        SoupSession *session;
+        PreconnectTestData data = { NULL, NULL, events, SOUP_CONNECTION_DISCONNECTED, NULL, TRUE };
+        GObject *conn;
+        SoupMessage *msg;
+
+        session = soup_test_session_new (SOUP_TYPE_SESSION_ASYNC,
+                                         SOUP_SESSION_USE_THREAD_CONTEXT, TRUE,
+                                         NULL);
+
+        if (proxy_uri)
+                g_object_set (session, SOUP_SESSION_PROXY_URI, proxy_uri, NULL);
+
+        data.loop = g_main_loop_new (NULL, FALSE);
+        g_signal_connect (session, "connection-created",
+                          G_CALLBACK (preconnection_created),
+                          &data);
+        soup_session_preconnect_async (session, uri, NULL,
+                                       (SoupSessionConnectProgressCallback)preconnect_progress,
+                                       (GAsyncReadyCallback)preconnect_finished,
+                                       &data);
+        g_main_loop_run (data.loop);
+        g_assert_no_error (data.error);
+        g_assert_nonnull (data.conn);
+        g_assert_cmpint (data.state, ==, SOUP_CONNECTION_IDLE);
+
+        while (*data.events) {
+                soup_test_assert (!*data.events,
+                                  "Expected %s",
+                                  event_name_from_abbrev (*data.events));
+                data.events++;
+        }
+
+        conn = data.conn;
+        data.conn = NULL;
+        msg = soup_message_new_from_uri ("GET", uri);
+        soup_session_send_message (session, msg);
+        soup_test_assert_message_status (msg, SOUP_STATUS_OK);
+        g_object_unref (msg);
+
+        /* connection-created hasn't been called. */
+        g_assert_null (data.conn);
+        g_assert_cmpint (data.state, ==, SOUP_CONNECTION_IDLE);
+
+        /* Preconnect again does nothing because there's already an idle connection ready. */
+        soup_session_preconnect_async (session, uri, NULL,
+                                       (SoupSessionConnectProgressCallback)preconnect_progress,
+                                       (GAsyncReadyCallback)preconnect_finished,
+                                       &data);
+        g_main_loop_run (data.loop);
+        g_assert_no_error (data.error);
+        g_assert_null (data.conn);
+        g_assert_cmpint (data.state, ==, SOUP_CONNECTION_IDLE);
+
+        soup_session_abort (session);
+        g_assert_cmpint (data.state, ==, SOUP_CONNECTION_DISCONNECTED);
+        g_object_unref (conn);
+
+        g_main_loop_unref (data.loop);
+
+        soup_test_session_abort_unref (session);
+}
+
+static void
+do_idle_connection_preconnect_fail_test (SoupURI *uri, GQuark domain, gint code, const char *events)
+{
+        SoupSession *session;
+        PreconnectTestData data = { NULL, NULL, events, SOUP_CONNECTION_DISCONNECTED, NULL, TRUE };
+
+        session = soup_test_session_new (SOUP_TYPE_SESSION_ASYNC,
+                                         SOUP_SESSION_USE_THREAD_CONTEXT, TRUE,
+                                         NULL);
+
+        if (tls_available)
+		g_object_set (session, SOUP_SESSION_SSL_USE_SYSTEM_CA_FILE, TRUE, NULL);
+
+        data.loop = g_main_loop_new (NULL, FALSE);
+        g_signal_connect (session, "connection-created",
+                          G_CALLBACK (preconnection_created),
+                          &data);
+        soup_session_preconnect_async (session, uri, NULL,
+                                       (SoupSessionConnectProgressCallback)preconnect_progress,
+                                       (GAsyncReadyCallback)preconnect_finished,
+                                       &data);
+        g_main_loop_run (data.loop);
+        g_assert_error (data.error, domain, code);
+        g_error_free (data.error);
+        g_assert_nonnull (data.conn);
+        g_assert_cmpint (data.state, ==, SOUP_CONNECTION_DISCONNECTED);
+        g_object_unref (data.conn);
+
+        while (*data.events) {
+                soup_test_assert (!*data.events,
+                                  "Expected %s",
+                                  event_name_from_abbrev (*data.events));
+                data.events++;
+        }
+
+        g_main_loop_unref (data.loop);
+
+        soup_test_session_abort_unref (session);
+}
+
+static void
+preconnect_message_completed (SoupSession        *session,
+                              SoupMessage        *msg,
+                              PreconnectTestData *data)
+{
+        g_main_loop_quit (data->loop);
+}
+
+static void
+do_steal_connection_preconnect_test (SoupURI *uri, SoupURI *proxy_uri, const char *events)
+{
+        SoupSession *session;
+        PreconnectTestData data = { NULL, NULL, events, SOUP_CONNECTION_DISCONNECTED, NULL, FALSE };
+        SoupMessage *msg;
+
+        session = soup_test_session_new (SOUP_TYPE_SESSION_ASYNC,
+                                         SOUP_SESSION_USE_THREAD_CONTEXT, TRUE,
+                                         NULL);
+
+        if (proxy_uri)
+                g_object_set (session, SOUP_SESSION_PROXY_URI, proxy_uri, NULL);
+
+        data.loop = g_main_loop_new (NULL, FALSE);
+        g_signal_connect (session, "connection-created",
+                          G_CALLBACK (preconnection_created),
+                          &data);
+        soup_session_preconnect_async (session, uri, NULL,
+                                       (SoupSessionConnectProgressCallback)preconnect_progress,
+                                       (GAsyncReadyCallback)preconnect_finished,
+                                       &data);
+        msg = soup_message_new_from_uri ("GET", uri);
+        soup_session_queue_message (session, msg,
+                                    (SoupSessionCallback)preconnect_message_completed,
+                                    &data);
+        g_main_loop_run (data.loop);
+        g_assert_no_error (data.error);
+        g_assert_nonnull (data.conn);
+        g_assert_cmpint (data.state, ==, SOUP_CONNECTION_IDLE);
+
+        while (*data.events) {
+                soup_test_assert (!*data.events,
+                                  "Expected %s",
+                                  event_name_from_abbrev (*data.events));
+                data.events++;
+        }
+
+        soup_session_abort (session);
+        g_assert_cmpint (data.state, ==, SOUP_CONNECTION_DISCONNECTED);
+        g_object_unref (data.conn);
+
+        g_main_loop_unref (data.loop);
+
+        soup_test_session_abort_unref (session);
+}
+
+static void
+do_steal_connection_preconnect_fail_test (SoupURI *uri, SoupStatus status, const char *events)
+{
+        SoupSession *session;
+        PreconnectTestData data = { NULL, NULL, events, SOUP_CONNECTION_DISCONNECTED, NULL, FALSE };
+        SoupMessage *msg;
+        SoupStatus status_code;
+
+        session = soup_test_session_new (SOUP_TYPE_SESSION_ASYNC,
+                                         SOUP_SESSION_USE_THREAD_CONTEXT, TRUE,
+                                         NULL);
+
+        if (tls_available)
+		g_object_set (session, SOUP_SESSION_SSL_USE_SYSTEM_CA_FILE, TRUE, NULL);
+
+        data.loop = g_main_loop_new (NULL, FALSE);
+        g_signal_connect (session, "connection-created",
+                          G_CALLBACK (preconnection_created),
+                          &data);
+        soup_session_preconnect_async (session, uri, NULL,
+                                       (SoupSessionConnectProgressCallback)preconnect_progress,
+                                       (GAsyncReadyCallback)preconnect_finished,
+                                       &data);
+        msg = soup_message_new_from_uri ("GET", uri);
+        soup_session_queue_message (session, g_object_ref (msg),
+                                    (SoupSessionCallback)preconnect_message_completed,
+                                    &data);
+        g_main_loop_run (data.loop);
+        g_assert_no_error (data.error);
+        g_assert_nonnull (data.conn);
+        g_assert_cmpint (data.state, ==, SOUP_CONNECTION_DISCONNECTED);
+        g_object_unref (data.conn);
+        g_object_get (msg, "status-code", &status_code, NULL);
+        g_assert_cmpint (status, ==, status_code);
+        g_object_unref (msg);
+
+        while (*data.events) {
+                soup_test_assert (!*data.events,
+                                  "Expected %s",
+                                  event_name_from_abbrev (*data.events));
+                data.events++;
+        }
+
+        g_main_loop_unref (data.loop);
+
+        soup_test_session_abort_unref (session);
+}
+
+static void
+do_connection_preconnect_test (void)
+{
+        SoupURI *http_uri;
+        SoupURI *proxy_uri;
+
+        SOUP_TEST_SKIP_IF_NO_APACHE;
+
+        debug_printf (1, "    http\n");
+        http_uri = soup_uri_new (HTTP_SERVER);
+        do_idle_connection_preconnect_test (http_uri, NULL, "rRcCx");
+        do_steal_connection_preconnect_test (http_uri, NULL, "r");
+
+        debug_printf (1, "    http with proxy\n");
+        proxy_uri = soup_uri_new (HTTP_PROXY);
+        do_idle_connection_preconnect_test (http_uri, proxy_uri, "rRcCx");
+        do_steal_connection_preconnect_test (http_uri, proxy_uri, "r");
+        soup_uri_free (http_uri);
+
+        debug_printf (1, "    wrong http (invalid port)\n");
+        http_uri = soup_uri_new (HTTP_SERVER);
+        http_uri->port = 1234;
+        do_idle_connection_preconnect_fail_test (http_uri,
+                                                 G_IO_ERROR, G_IO_ERROR_CONNECTION_REFUSED,
+                                                 "rRcr"); /* FIXME: why r again? GLib bug? */
+        do_steal_connection_preconnect_fail_test (http_uri,
+                                                  SOUP_STATUS_CANT_CONNECT,
+                                                  "r");
+        soup_uri_free (http_uri);
+
+        if (tls_available) {
+                SoupURI *https_uri;
+
+                debug_printf (1, "    https\n");
+                https_uri = soup_uri_new (HTTPS_SERVER);
+                do_idle_connection_preconnect_test (https_uri, NULL, "rRcCtTx");
+                do_steal_connection_preconnect_test (https_uri, NULL, "r");
+
+                debug_printf (1, "    https with proxy\n");
+                do_idle_connection_preconnect_test (https_uri, proxy_uri, "rRcCpPtTx");
+                do_steal_connection_preconnect_test (https_uri, proxy_uri, "r");
+
+                debug_printf (1, "    wrong https (invalid certificate)\n");
+                do_idle_connection_preconnect_fail_test (https_uri,
+                                                         G_TLS_ERROR, G_TLS_ERROR_BAD_CERTIFICATE,
+                                                         "rRcCt");
+                do_steal_connection_preconnect_fail_test (https_uri,
+                                                          SOUP_STATUS_SSL_FAILED,
+                                                          "r");
+                soup_uri_free (https_uri);
+        } else
+                debug_printf (1, "    https -- SKIPPING\n");
+
+        soup_uri_free (proxy_uri);
+}
+
 int
 main (int argc, char **argv)
 {
@@ -1209,6 +1536,7 @@ main (int argc, char **argv)
 	g_test_add_func ("/connection/state", do_connection_state_test);
 	g_test_add_func ("/connection/event", do_connection_event_test);
 	g_test_add_func ("/connection/connect", do_connection_connect_test);
+	g_test_add_func ("/connection/preconnect", do_connection_preconnect_test);
 
 	ret = g_test_run ();
 

@@ -71,6 +71,8 @@ SoupMessageQueueItem *soup_message_queue_append     (SoupMessageQueue     *queue
 
 SoupMessageQueueItem *soup_message_queue_lookup     (SoupMessageQueue     *queue,
 						     SoupMessage          *msg);
+SoupMessageQueueItem *soup_message_queue_lookup_by_connection (SoupMessageQueue *queue,
+                                                               SoupConnection   *conn);
 
 SoupMessageQueueItem *soup_message_queue_first      (SoupMessageQueue     *queue);
 SoupMessageQueueItem *soup_message_queue_next       (SoupMessageQueue     *queue,

@@ -252,6 +252,18 @@ GIOStream *soup_session_connect_finish (SoupSession                       *sessi
 					GAsyncResult                      *result,
 					GError                           **error);
 
+SOUP_AVAILABLE_IN_2_74
+void       soup_session_preconnect_async  (SoupSession                       *session,
+					   SoupURI                           *uri,
+					   GCancellable                      *cancellable,
+					   SoupSessionConnectProgressCallback progress_callback,
+					   GAsyncReadyCallback                callback,
+					   gpointer                           user_data);
+SOUP_AVAILABLE_IN_2_74
+gboolean   soup_session_preconnect_finish (SoupSession                       *session,
+					   GAsyncResult                      *result,
+					   GError                           **error);
+
 G_END_DECLS
 
 #endif /* __SOUP_SESSION_H__ */

@@ -224,6 +224,25 @@ soup_message_queue_lookup (SoupMessageQueue *queue, SoupMessage *msg)
 	return item;
 }
 
+SoupMessageQueueItem *
+soup_message_queue_lookup_by_connection (SoupMessageQueue *queue,
+                                         SoupConnection   *conn)
+{
+        SoupMessageQueueItem *item;
+
+        g_mutex_lock (&queue->mutex);
+
+        item = queue->tail;
+        while (item && (item->removed || item->conn != conn))
+                item = item->prev;
+
+        if (item)
+                item->ref_count++;
+
+        g_mutex_unlock (&queue->mutex);
+        return item;
+}
+
 /**
  * soup_message_queue_first:
  * @queue: a #SoupMessageQueue

@@ -488,6 +488,8 @@ soup_session_steal_connection
 SoupSessionConnectProgressCallback
 soup_session_connect_async
 soup_session_connect_finish
+soup_session_preconnect_async
+soup_session_preconnect_finish
 <SUBSECTION>
 SOUP_SESSION_PROXY_URI
 SOUP_SESSION_PROXY_RESOLVER

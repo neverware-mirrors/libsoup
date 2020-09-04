@@ -1778,6 +1778,17 @@ connect_async_complete (GObject      *object,
 	GError *error = NULL;
 
 	soup_connection_connect_finish (conn, result, &error);
+	if (item->related) {
+		SoupMessageQueueItem *new_item = item->related;
+
+		/* Complete the preconnect successfully, since it was stolen. */
+		item->state = SOUP_MESSAGE_FINISHING;
+		item->related = NULL;
+		soup_session_process_queue_item (item->session, item, NULL, FALSE);
+		soup_message_queue_item_unref (item);
+
+		item = new_item;
+	}
 	connect_complete (item, conn, error);
 
 	if (item->state == SOUP_MESSAGE_CONNECTED ||
@@ -1787,6 +1798,35 @@ connect_async_complete (GObject      *object,
 		soup_session_kick_queue (item->session);
 
 	soup_message_queue_item_unref (item);
+}
+
+static gboolean
+steal_preconnection (SoupSession          *session,
+                     SoupMessageQueueItem *item,
+                     SoupConnection       *conn)
+{
+        SoupSessionPrivate *priv = soup_session_get_instance_private (session);
+        SoupMessageQueueItem *preconnect_item;
+
+        if (!item->async)
+                return FALSE;
+
+        preconnect_item = soup_message_queue_lookup_by_connection (priv->queue, conn);
+        if (!preconnect_item)
+                return FALSE;
+
+        if (!preconnect_item->connect_only || preconnect_item->state != SOUP_MESSAGE_CONNECTING) {
+                soup_message_queue_item_unref (preconnect_item);
+                return FALSE;
+        }
+
+        soup_session_set_item_connection (session, preconnect_item, NULL);
+        g_assert (preconnect_item->related == NULL);
+        preconnect_item->related = item;
+        soup_message_queue_item_ref (item);
+        soup_message_queue_item_unref (preconnect_item);
+
+        return TRUE;
 }
 
 /* requires conn_lock */
@@ -1815,11 +1855,22 @@ get_connection_for_host (SoupSession *session,
 	for (conns = host->connections; conns; conns = conns->next) {
 		conn = conns->data;
 
-		if (!need_new_connection && soup_connection_get_state (conn) == SOUP_CONNECTION_IDLE) {
-			soup_connection_set_state (conn, SOUP_CONNECTION_IN_USE);
-			return conn;
-		} else if (soup_connection_get_state (conn) == SOUP_CONNECTION_CONNECTING)
+		switch (soup_connection_get_state (conn)) {
+		case SOUP_CONNECTION_IDLE:
+			if (!need_new_connection) {
+				soup_connection_set_state (conn, SOUP_CONNECTION_IN_USE);
+				return conn;
+			}
+			break;
+		case SOUP_CONNECTION_CONNECTING:
+			if (steal_preconnection (session, item, conn)) {
+				return conn;
+			}
 			num_pending++;
+			break;
+		default:
+			break;
+		}
 	}
 
 	/* Limit the number of pending connections; num_messages / 2
@@ -1940,10 +1991,20 @@ get_connection (SoupMessageQueueItem *item, gboolean *should_cleanup)
 	soup_session_set_item_connection (session, item, conn);
 	item->conn_is_dedicated = is_dedicated_connection;
 
-	if (soup_connection_get_state (item->conn) != SOUP_CONNECTION_NEW) {
+	switch (soup_connection_get_state (item->conn)) {
+	case SOUP_CONNECTION_IN_USE:
 		item->state = SOUP_MESSAGE_READY;
 		soup_message_set_https_status (item->msg, item->conn);
 		return TRUE;
+	case SOUP_CONNECTION_CONNECTING:
+		item->state = SOUP_MESSAGE_CONNECTING;
+		return FALSE;
+	case SOUP_CONNECTION_NEW:
+		break;
+	case SOUP_CONNECTION_IDLE:
+	case SOUP_CONNECTION_REMOTE_DISCONNECTED:
+	case SOUP_CONNECTION_DISCONNECTED:
+		g_assert_not_reached ();
 	}
 
 	item->state = SOUP_MESSAGE_CONNECTING;
@@ -5003,7 +5064,8 @@ soup_session_websocket_connect_finish (SoupSession      *session,
  * @connection: the current state of the network connection
  * @user_data: the data passed to soup_session_connect_async().
  *
- * Prototype for the progress callback passed to soup_session_connect_async().
+ * Prototype for the progress callback passed to soup_session_connect_async() and
+ * soup_session_preconnect_async().
  *
  * Since: 2.62
  */
@@ -5148,4 +5210,118 @@ soup_session_connect_finish (SoupSession  *session,
         g_return_val_if_fail (g_task_is_valid (result, session), NULL);
 
         return g_task_propagate_pointer (G_TASK (result), error);
+}
+
+static void
+preconnect_async_message_finished (SoupMessage *msg,
+                                   GTask       *task)
+{
+        ConnectAsyncData *data = g_task_get_task_data (task);
+        SoupMessageQueueItem *item = data->item;
+
+        if (item->conn && !item->error)
+                soup_connection_set_reusable (item->conn, TRUE);
+}
+
+static void
+preconnect_async_complete (SoupSession *session,
+                           SoupMessage *msg,
+                           GTask       *task)
+{
+        ConnectAsyncData *data = g_task_get_task_data (task);
+        SoupMessageQueueItem *item = data->item;
+
+        if (item->error)
+                g_task_return_error (task, g_error_copy (item->error));
+        else
+                g_task_return_boolean (task, TRUE);
+        g_object_unref (task);
+}
+
+/**
+ * soup_session_preconnect_async:
+ * @session: a #SoupSession
+ * @uri: a #SoupURI to preconnect to
+ * @cancellable: a #GCancellable
+ * @progress_callback: (allow-none) (scope async): a #SoupSessionConnectProgressCallback which
+ * will be called for every network event that occurs during the connection.
+ * @callback: (allow-none) (scope async): the callback to invoke when the operation finishes
+ * @user_data: data for @progress_callback and @callback
+ *
+ * Start a preconnection to @uri. Once the connection is done, it will remain in idle state so that
+ * it can be reused by future requests. If there's already an idle connection for the given @uri
+ * host, the operation finishes successfully without creating a new connection. If a new request
+ * for the given @uri host is made while the preconnect is still ongoing, the request will take
+ * the ownership of the connection and the preconnect operation will finish successfully (if
+ * there's a connection error it will be handled by the request).
+ *
+ * The operation can be monitored by providing a @progress_callback and finishes when the connection
+ * is done or an error ocurred.
+ *
+ * Since: 2.74
+ */
+void
+soup_session_preconnect_async (SoupSession                       *session,
+                               SoupURI                           *uri,
+                               GCancellable                      *cancellable,
+                               SoupSessionConnectProgressCallback progress_callback,
+                               GAsyncReadyCallback                callback,
+                               gpointer                           user_data)
+{
+        SoupSessionPrivate *priv;
+        SoupMessage *msg;
+        SoupMessageQueueItem *item;
+        ConnectAsyncData *data;
+        GTask *task;
+
+        g_return_if_fail (SOUP_IS_SESSION (session));
+        g_return_if_fail (!SOUP_IS_SESSION_SYNC (session));
+        priv = soup_session_get_instance_private (session);
+        g_return_if_fail (priv->use_thread_context);
+        g_return_if_fail (uri != NULL);
+
+        task = g_task_new (session, cancellable, callback, user_data);
+
+        msg = soup_message_new_from_uri (SOUP_METHOD_HEAD, uri);
+        g_signal_connect_object (msg, "finished",
+                                 G_CALLBACK (preconnect_async_message_finished),
+                                 task, 0);
+        if (progress_callback) {
+                g_signal_connect_object (msg, "network-event",
+                                         G_CALLBACK (connect_async_message_network_event),
+                                         task, 0);
+        }
+
+        item = soup_session_append_queue_item (session, msg, TRUE, FALSE,
+                                               (SoupSessionCallback) preconnect_async_complete,
+                                               task);
+        item->connect_only = TRUE;
+        data = connect_async_data_new (item, progress_callback, user_data);
+        g_task_set_task_data (task, data, (GDestroyNotify) connect_async_data_free);
+        soup_session_kick_queue (session);
+        soup_message_queue_item_unref (item);
+        g_object_unref (msg);
+}
+
+/**
+ * soup_session_preconnect_finish:
+ * @session: a #SoupSession
+ * @result: the #GAsyncResult passed to your callback
+ * @error: return location for a #GError, or %NULL
+ *
+ * Complete a preconnect async operation started with soup_session_preconnect_async().
+ *
+ * Return value: %TRUE if the preconnect succeeded, or %FALSE in case of error.
+ *
+ * Since: 2.74
+ */
+gboolean
+soup_session_preconnect_finish (SoupSession  *session,
+                                GAsyncResult *result,
+                                GError      **error)
+{
+        g_return_val_if_fail (SOUP_IS_SESSION (session), FALSE);
+        g_return_val_if_fail (g_task_is_valid (result, session), FALSE);
+
+        return g_task_propagate_boolean (G_TASK (result), error);
 }
