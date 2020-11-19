@@ -361,8 +361,7 @@ if find_program('xgettext', required : false).found()
   subdir('po')
 endif
 
-# FIXME: port examples to use the new API.
-#subdir('examples')
+subdir('examples')
 
 if get_option('tests')
   subdir('tests')
